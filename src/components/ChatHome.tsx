@@ -1,52 +1,87 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import { createGreenApi, GreenApiError, normalizePhone } from '../api/client.ts'
+import { applyNotification } from '../state/notifications.ts'
+import type { ChatMessage, InboxState } from '../state/notifications.ts'
 import type { GreenApiConfig } from '../types/green-api.ts'
 
-type Chat = {
-  chatId: string
-  phone: string
-  title: string
-}
-
-type OutgoingMessage = {
-  localId: string
-  idMessage: string | null
-  chatId: string
-  text: string
-  status: 'sending' | 'sent' | 'failed'
-}
-
 const messageLimit = 4096
+const missingAccountMessage =
+  'Telegram на этом номере не найден или скрыт настройками приватности.'
 
 type ChatHomeProps = {
   session: GreenApiConfig
   onLogout: () => void
+  onSessionEnd: (message: string) => void
 }
 
-const missingAccountMessage =
-  'Telegram на этом номере не найден или скрыт настройками приватности.'
-
-export function ChatHome({ session, onLogout }: ChatHomeProps) {
+export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
   const api = useMemo(() => createGreenApi(session), [session])
-  const [chats, setChats] = useState<Chat[]>([])
+  const [inbox, setInbox] = useState<InboxState>({
+    chats: [],
+    messages: [],
+    instanceState: 'authorized',
+  })
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
   const [phone, setPhone] = useState('')
   const [error, setError] = useState('')
   const [pending, setPending] = useState(false)
-  const [messages, setMessages] = useState<OutgoingMessage[]>([])
   const [draft, setDraft] = useState('')
   const [composerError, setComposerError] = useState('')
+  const [offline, setOffline] = useState(false)
   const logRef = useRef<HTMLDivElement>(null)
+  const sessionEndRef = useRef(onSessionEnd)
 
-  const activeChat = chats.find((chat) => chat.chatId === activeChatId) ?? null
-  const visibleMessages = messages.filter((message) => message.chatId === activeChatId)
+  useEffect(() => {
+    sessionEndRef.current = onSessionEnd
+  }, [onSessionEnd])
+
+  const activeChat = inbox.chats.find((chat) => chat.chatId === activeChatId) ?? null
+  const visibleMessages = inbox.messages.filter((message) => message.chatId === activeChatId)
+  const canSend = inbox.instanceState === 'authorized'
 
   useEffect(() => {
     const log = logRef.current
     if (log) log.scrollTop = log.scrollHeight
-  }, [messages, activeChatId])
+  }, [inbox.messages, activeChatId])
+
+  useEffect(() => {
+    let cancelled = false
+    let failureDelay = 0
+
+    async function pause(ms: number) {
+      await new Promise((resolve) => setTimeout(resolve, ms))
+    }
+
+    async function loop() {
+      while (!cancelled) {
+        if (failureDelay > 0) await pause(failureDelay)
+        if (cancelled) return
+
+        try {
+          const note = await api.receiveNotification(failureDelay > 0 ? 5 : 20)
+          failureDelay = 0
+          if (!cancelled) setOffline(false)
+          if (!note) continue
+          if (!cancelled) setInbox((current) => applyNotification(current, note))
+          await api.deleteNotification(note.receiptId)
+        } catch (caught) {
+          if (caught instanceof GreenApiError && (caught.status === 401 || caught.status === 403)) {
+            if (!cancelled) sessionEndRef.current(caught.message)
+            return
+          }
+          failureDelay = failureDelay === 0 ? 1000 : Math.min(failureDelay * 2, 15000)
+          if (!cancelled) setOffline(true)
+        }
+      }
+    }
+
+    void loop()
+    return () => {
+      cancelled = true
+    }
+  }, [api])
 
   async function createChat(rawPhone: string) {
     const digits = normalizePhone(rawPhone)
@@ -64,14 +99,17 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
         return
       }
 
-      const chat: Chat = {
+      const chat = {
         chatId: account.chatId,
         phone: digits,
         title: account.username?.trim() || digits,
       }
-      setChats((current) =>
-        current.some((item) => item.chatId === chat.chatId) ? current : [chat, ...current],
-      )
+      setInbox((current) => ({
+        ...current,
+        chats: current.chats.some((item) => item.chatId === chat.chatId)
+          ? current.chats
+          : [chat, ...current.chats],
+      }))
       setActiveChatId(chat.chatId)
       setPhone('')
       setCreating(false)
@@ -89,7 +127,7 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
   }
 
   function submitDraft() {
-    if (!activeChat) return
+    if (!activeChat || !canSend) return
     const text = draft
     if (text.trim().length === 0) return
     if ([...text].length > messageLimit) {
@@ -110,31 +148,32 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
   }
 
   async function deliver(chatId: string, text: string, localId = `local-${crypto.randomUUID()}`) {
-    setMessages((current) => {
-      const exists = current.some((message) => message.localId === localId)
-      if (!exists) {
-        return [...current, { localId, idMessage: null, chatId, text, status: 'sending' }]
-      }
-      return current.map((message) =>
-        message.localId === localId ? { ...message, status: 'sending' } : message,
-      )
-    })
+    setInbox((current) => ({
+      ...current,
+      messages: upsertOutgoing(current.messages, { localId, chatId, text }),
+    }))
 
     try {
       const result = await api.sendMessage(chatId, text)
-      setMessages((current) =>
-        current.map((message) =>
-          message.localId === localId
-            ? { ...message, idMessage: result.idMessage, status: 'sent' }
-            : message,
-        ),
-      )
+      setInbox((current) => ({
+        ...current,
+        messages: current.messages.some(
+          (message) => message.idMessage === result.idMessage && message.localId !== localId,
+        )
+          ? current.messages.filter((message) => message.localId !== localId)
+          : current.messages.map((message) =>
+              message.localId === localId
+                ? { ...message, idMessage: result.idMessage, status: 'sent' }
+                : message,
+            ),
+      }))
     } catch {
-      setMessages((current) =>
-        current.map((message) =>
+      setInbox((current) => ({
+        ...current,
+        messages: current.messages.map((message) =>
           message.localId === localId ? { ...message, status: 'failed' } : message,
         ),
-      )
+      }))
     }
   }
 
@@ -147,6 +186,8 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
           Выйти
         </button>
       </header>
+      {offline ? <p className="offline-banner">Нет связи</p> : null}
+      {!canSend ? <p className="instance-banner">{instanceMessage(inbox.instanceState)}</p> : null}
       <div className="workspace-body">
         <aside className="chat-list">
           <button type="button" className="new-chat" onClick={() => setCreating(true)}>
@@ -189,7 +230,7 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
             </form>
           ) : null}
           <ul>
-            {chats.map((chat) => (
+            {inbox.chats.map((chat) => (
               <li key={chat.chatId}>
                 <button
                   type="button"
@@ -212,27 +253,23 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
               </header>
               <div className="conversation-log" ref={logRef}>
                 {visibleMessages.map((message) => (
-                  <article key={message.localId} className="message">
+                  <article key={message.localId} className={`message message-${message.direction}`}>
                     <p>{message.text}</p>
-                    <div className={message.status === 'failed' ? 'message-status is-failed' : 'message-status'}>
-                      <span>
-                        {message.status === 'sending'
-                          ? 'отправляется'
-                          : message.status === 'sent'
-                            ? 'отправлено'
-                            : 'не отправилось'}
-                      </span>
-                      {message.status === 'failed' ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            void deliver(message.chatId, message.text, message.localId)
-                          }}
-                        >
-                          Повторить
-                        </button>
-                      ) : null}
-                    </div>
+                    {message.direction === 'out' ? (
+                      <div className={message.status === 'failed' ? 'message-status is-failed' : 'message-status'}>
+                        <span>{outgoingStatus(message)}</span>
+                        {message.status === 'failed' ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void deliver(message.chatId, message.text, message.localId)
+                            }}
+                          >
+                            Повторить
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </article>
                 ))}
               </div>
@@ -254,10 +291,13 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
                     rows={1}
                     value={draft}
                     placeholder="Сообщение"
+                    disabled={!canSend}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleDraftKeyDown}
                   />
-                  <button type="submit">Отправить</button>
+                  <button type="submit" disabled={!canSend}>
+                    Отправить
+                  </button>
                 </div>
               </form>
             </>
@@ -268,4 +308,37 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
       </div>
     </div>
   )
+}
+
+function upsertOutgoing(messages: ChatMessage[], next: { localId: string; chatId: string; text: string }) {
+  const exists = messages.some((message) => message.localId === next.localId)
+  if (!exists) {
+    return [
+      ...messages,
+      {
+        localId: next.localId,
+        idMessage: null,
+        chatId: next.chatId,
+        text: next.text,
+        direction: 'out' as const,
+        status: 'sending' as const,
+      },
+    ]
+  }
+  return messages.map((message) =>
+    message.localId === next.localId ? { ...message, status: 'sending' as const } : message,
+  )
+}
+
+function outgoingStatus(message: ChatMessage): string {
+  if (message.status === 'sending') return 'отправляется'
+  if (message.status === 'failed') return 'не отправилось'
+  return 'отправлено'
+}
+
+function instanceMessage(state: string): string {
+  if (state === 'notAuthorized' || state === 'starting') {
+    return 'Авторизуйте инстанс в личном кабинете GREEN-API.'
+  }
+  return `Инстанс сейчас недоступен (${state}).`
 }
