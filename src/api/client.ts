@@ -13,6 +13,22 @@ import type {
 
 const messageLimit = 4096
 
+export const errorText = {
+  unauthorized:
+    'Инстанс не авторизован или ещё запускается. Авторизуйте его в личном кабинете GREEN-API.',
+  instanceUnavailable: 'Инстанс сейчас недоступен. Проверьте его в личном кабинете GREEN-API.',
+  webhook: 'В кабинете заполнен webhook, приём сообщений по HTTP API недоступен. Очистите webhookUrl.',
+  hiddenAccount: 'Telegram на этом номере не найден или скрыт настройками приватности.',
+  phoneRateLimit: 'Слишком много проверок номеров. Подождите и повторите запрос позже.',
+  rateLimit: 'Слишком много запросов. Подождите и повторите позже.',
+  tooLong: 'Текст сообщения длиннее 4096 символов.',
+  offline: 'Нет сети, приём сообщений временно остановлен.',
+  receivePaused: 'Приём сообщений временно остановлен.',
+  badCredentials: 'Пара idInstance и apiTokenInstance не подошла.',
+  network: 'Нет связи с GREEN-API.',
+  generic: 'Запрос к GREEN-API не выполнился.',
+} as const
+
 const accountCache = new Map<string, CheckAccountResult>()
 const contactCache = new Map<string, ContactInfo>()
 
@@ -60,13 +76,24 @@ export function exportAccounts(idInstance: string): Record<string, CheckAccountR
   return accounts
 }
 
+export function greenApiUrl(): string {
+  return (import.meta.env.VITE_GREEN_API_URL ?? '').trim().replace(/\/+$/, '')
+}
+
+export function withApiUrl(config: GreenApiConfig): GreenApiConfig {
+  return { ...config, apiUrl: greenApiUrl() }
+}
+
 export function createGreenApi(config: GreenApiConfig): GreenApiClient {
-  const apiUrl = config.apiUrl.trim().replace(/\/+$/, '')
+  const apiUrl = greenApiUrl()
   const idInstance = config.idInstance.trim()
   const apiTokenInstance = config.apiTokenInstance.trim()
 
-  if (!apiUrl || !idInstance || !apiTokenInstance) {
-    throw new GreenApiError('Не заполнены apiUrl, idInstance или apiTokenInstance.', 400)
+  if (!apiUrl) {
+    throw new GreenApiError('Не задан адрес API. Укажите VITE_GREEN_API_URL в файле .env.', 400, 'missing_api_url')
+  }
+  if (!idInstance || !apiTokenInstance) {
+    throw new GreenApiError('Не заполнены idInstance или apiTokenInstance.', 400, 'missing_fields')
   }
 
   const endpoint = (method: string, extra = '') =>
@@ -88,11 +115,19 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
       const saved = accountCache.get(key)
       if (saved) return saved
 
-      const body = await request(endpoint('checkAccount'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phoneNumber: Number(digits) }),
-      })
+      let body: unknown
+      try {
+        body = await request(endpoint('checkAccount'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phoneNumber: Number(digits) }),
+        })
+      } catch (error) {
+        if (error instanceof GreenApiError && isRateLimit(error)) {
+          throw new GreenApiError(errorText.phoneRateLimit, error.status || 469, error.reason)
+        }
+        throw error
+      }
       const result = parseCheckAccount(body)
       accountCache.set(key, result)
       return result
@@ -138,7 +173,7 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
         throw new GreenApiError('Пустое сообщение не отправляется.', 400, 'empty_message')
       }
       if ([...text].length > messageLimit) {
-        throw new GreenApiError('Текст сообщения длиннее 4096 символов.', 400, 'message_too_long')
+        throw new GreenApiError(errorText.tooLong, 400, 'message_too_long')
       }
       if (chatId.trim().length === 0) {
         throw new GreenApiError('Не указан chatId.', 400, 'empty_chat')
@@ -186,7 +221,7 @@ async function request(url: string, init?: RequestInit): Promise<unknown> {
   try {
     response = await fetch(url, init)
   } catch {
-    throw new GreenApiError('Нет связи с GREEN-API.', 0, 'network')
+    throw new GreenApiError(errorText.network, 0, 'network')
   }
 
   const body = await readBody(response)
@@ -229,31 +264,19 @@ function toError(status: number, body: unknown): GreenApiError {
   const reason = reasonFrom(body)
 
   if (status === 401 || status === 403) {
-    return new GreenApiError('Пара idInstance и apiTokenInstance не подошла.', status, reason)
+    return new GreenApiError(errorText.badCredentials, status, reason)
   }
-  if (
-    status === 469 ||
-    reason === 'rate_limit_exceeded' ||
-    reason === 'Rate limited by messenger'
-  ) {
-    return new GreenApiError(
-      'Слишком много проверок номеров. Подождите и повторите запрос позже.',
-      status || 469,
-      reason,
-    )
+  if (isRateLimitReason(status, reason)) {
+    return new GreenApiError(errorText.rateLimit, status || 469, reason)
   }
   if (reason === 'instance is starting or not authorized') {
-    return new GreenApiError('Инстанс не авторизован или ещё запускается.', status, reason)
+    return new GreenApiError(errorText.unauthorized, status, reason)
   }
   if (reason?.toLowerCase().includes('webhook')) {
-    return new GreenApiError(
-      'В кабинете заполнен webhook. Очистите webhookUrl, чтобы принимать сообщения.',
-      status,
-      reason,
-    )
+    return new GreenApiError(errorText.webhook, status, reason)
   }
   if (reason?.includes('4096')) {
-    return new GreenApiError('Текст сообщения длиннее 4096 символов.', status, reason)
+    return new GreenApiError(errorText.tooLong, status, reason)
   }
   if (reason?.toLowerCase().includes('phonenumber')) {
     return new GreenApiError('Номер должен содержать только цифры.', status, reason)
@@ -265,7 +288,15 @@ function toError(status: number, body: unknown): GreenApiError {
     return new GreenApiError('Это сообщение нельзя удалить.', status, reason)
   }
 
-  return new GreenApiError('Запрос к GREEN-API не выполнился.', status, reason)
+  return new GreenApiError(errorText.generic, status, reason)
+}
+
+function isRateLimit(error: GreenApiError): boolean {
+  return isRateLimitReason(error.status, error.reason)
+}
+
+function isRateLimitReason(status: number, reason: string | undefined): boolean {
+  return status === 469 || reason === 'rate_limit_exceeded' || reason === 'Rate limited by messenger'
 }
 
 function parseState(body: unknown): StateInstanceResult {

@@ -103,13 +103,14 @@ textarea {
 
 .login-card .form-error {
   text-align: center;
+  color: #d92d20;
 }
 
 .form-error {
   margin: 0 0 14px;
-  color: #b42318;
+  color: #d92d20;
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 650;
 }
 
 .workspace {

@@ -2,28 +2,28 @@ import { useState } from 'react'
 import type { FormEvent } from 'react'
 import type { GreenApiConfig } from '../types/green-api.ts'
 
+type LoginValues = Pick<GreenApiConfig, 'idInstance' | 'apiTokenInstance'>
+
 type LoginScreenProps = {
-  initial: GreenApiConfig | null
+  initial: LoginValues | null
   error: string
   pending: boolean
-  onSubmit: (config: GreenApiConfig) => void
+  onSubmit: (values: LoginValues) => void
 }
 
-const emptyConfig: GreenApiConfig = {
-  apiUrl: '',
+const emptyValues: LoginValues = {
   idInstance: '',
   apiTokenInstance: '',
 }
 
 export function LoginScreen({ initial, error, pending, onSubmit }: LoginScreenProps) {
-  const [config, setConfig] = useState<GreenApiConfig>(initial ?? emptyConfig)
+  const [values, setValues] = useState<LoginValues>(initial ?? emptyValues)
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     onSubmit({
-      apiUrl: config.apiUrl.trim(),
-      idInstance: config.idInstance.trim(),
-      apiTokenInstance: config.apiTokenInstance.trim(),
+      idInstance: values.idInstance.trim(),
+      apiTokenInstance: values.apiTokenInstance.trim(),
     })
   }
 
@@ -38,26 +38,14 @@ export function LoginScreen({ initial, error, pending, onSubmit }: LoginScreenPr
           </h1>
 
           <label>
-            apiUrl
-            <input
-              name="apiUrl"
-              value={config.apiUrl}
-              autoComplete="url"
-              placeholder="https://4100.api.green-api.com"
-              required
-              onChange={(event) => setConfig({ ...config, apiUrl: event.target.value })}
-            />
-          </label>
-
-          <label>
             idInstance
             <input
               name="idInstance"
-              value={config.idInstance}
+              value={values.idInstance}
               inputMode="numeric"
               autoComplete="username"
               required
-              onChange={(event) => setConfig({ ...config, idInstance: event.target.value })}
+              onChange={(event) => setValues({ ...values, idInstance: event.target.value })}
             />
           </label>
 
@@ -66,10 +54,10 @@ export function LoginScreen({ initial, error, pending, onSubmit }: LoginScreenPr
             <input
               name="apiTokenInstance"
               type="password"
-              value={config.apiTokenInstance}
+              value={values.apiTokenInstance}
               autoComplete="current-password"
               required
-              onChange={(event) => setConfig({ ...config, apiTokenInstance: event.target.value })}
+              onChange={(event) => setValues({ ...values, apiTokenInstance: event.target.value })}
             />
           </label>
 

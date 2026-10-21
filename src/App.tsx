@@ -1,11 +1,9 @@
 import { useEffect, useState } from 'react'
-import { createGreenApi, GreenApiError } from './api/client.ts'
+import { createGreenApi, errorText, GreenApiError, withApiUrl } from './api/client.ts'
 import { ChatHome } from './components/ChatHome.tsx'
 import { LoginScreen } from './components/LoginScreen.tsx'
 import { clearSession, readSession, writeSession } from './storage/session.ts'
 import type { GreenApiConfig } from './types/green-api.ts'
-
-const unauthorizedMessage = 'Авторизуйте инстанс в личном кабинете GREEN-API.'
 
 export default function App() {
   const [session, setSession] = useState<GreenApiConfig | null>(null)
@@ -29,7 +27,8 @@ export default function App() {
     }
   }, [])
 
-  async function handleSubmit(config: GreenApiConfig) {
+  async function handleSubmit(values: Pick<GreenApiConfig, 'idInstance' | 'apiTokenInstance'>) {
+    const config = withApiUrl({ ...values, apiUrl: '' })
     setPending(true)
     setError('')
     setDraft(config)
@@ -58,7 +57,7 @@ export default function App() {
   if (!session) {
     return (
       <LoginScreen
-        key={draft ? `${draft.idInstance}:${draft.apiUrl}` : 'empty'}
+        key={draft?.idInstance || 'empty'}
         initial={draft}
         error={error}
         pending={pending}
@@ -86,20 +85,21 @@ export default function App() {
 async function restore(): Promise<{ session: GreenApiConfig | null; draft: GreenApiConfig | null; error: string }> {
   const stored = await readSession()
   if (!stored) return { session: null, draft: null, error: '' }
-  const result = await openSession(stored)
-  if (result === 'authorized') return { session: stored, draft: stored, error: '' }
-  await clearSession(stored.idInstance)
-  return { session: null, draft: stored, error: result }
+  const config = withApiUrl(stored)
+  const result = await openSession(config)
+  if (result === 'authorized') return { session: config, draft: config, error: '' }
+  await clearSession(config.idInstance)
+  return { session: null, draft: config, error: result }
 }
 
 async function openSession(config: GreenApiConfig): Promise<'authorized' | string> {
   try {
     const { stateInstance } = await createGreenApi(config).getStateInstance()
     if (stateInstance === 'authorized') return 'authorized'
-    if (stateInstance === 'notAuthorized' || stateInstance === 'starting') return unauthorizedMessage
-    return `Инстанс сейчас недоступен (${stateInstance}).`
+    if (stateInstance === 'notAuthorized' || stateInstance === 'starting') return errorText.unauthorized
+    return errorText.instanceUnavailable
   } catch (error) {
     if (error instanceof GreenApiError) return error.message
-    return 'Запрос к GREEN-API не выполнился.'
+    return errorText.generic
   }
 }

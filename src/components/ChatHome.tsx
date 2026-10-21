@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
-import { createGreenApi, exportAccounts, GreenApiError, hydrateAccounts, normalizePhone } from '../api/client.ts'
+import { createGreenApi, errorText, exportAccounts, GreenApiError, hydrateAccounts, normalizePhone } from '../api/client.ts'
 import type { HistoryEntry, ListedChat } from '../types/green-api.ts'
 import { applyNotification, isPlaceholderTitle } from '../state/notifications.ts'
 import type { ChatItem, ChatMessage, InboxState } from '../state/notifications.ts'
@@ -8,8 +8,6 @@ import { readCabinet, writeCabinet } from '../storage/session.ts'
 import type { GreenApiConfig } from '../types/green-api.ts'
 
 const messageLimit = 4096
-const missingAccountMessage =
-  'Telegram на этом номере не найден или скрыт настройками приватности.'
 const avatarColors = ['#3390ec', '#4fae4e', '#e36a5d', '#7b68ee', '#e39b2b', '#3d9a9a']
 const messageSkeleton = [
   { side: 'in', lines: 2 },
@@ -49,7 +47,7 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
   const [composerError, setComposerError] = useState('')
   const [replyTo, setReplyTo] = useState<ReplyTarget | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
-  const [offline, setOffline] = useState(false)
+  const [receiveNotice, setReceiveNotice] = useState('')
   const [hydrated, setHydrated] = useState(false)
   const [chatsLoading, setChatsLoading] = useState(true)
   const [historySettled, setHistorySettled] = useState<Record<string, true>>({})
@@ -181,7 +179,7 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
         try {
           const note = await api.receiveNotification(failureDelay > 0 ? 5 : 20)
           failureDelay = 0
-          if (!cancelled) setOffline(false)
+          if (!cancelled) setReceiveNotice('')
           if (!note) continue
           if (!cancelled) setInbox((current) => applyNotification(current, note))
           await api.deleteNotification(note.receiptId)
@@ -191,7 +189,10 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
             return
           }
           failureDelay = failureDelay === 0 ? 1000 : Math.min(failureDelay * 2, 15000)
-          if (!cancelled) setOffline(true)
+          if (!cancelled) {
+            const offline = caught instanceof GreenApiError && caught.reason === 'network'
+            setReceiveNotice(offline ? errorText.offline : errorText.receivePaused)
+          }
         }
       }
     }
@@ -214,7 +215,7 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
     try {
       const account = await api.checkAccount(digits)
       if (!account.exist || account.chatId.length === 0) {
-        setError(missingAccountMessage)
+        setError(errorText.hiddenAccount)
         return
       }
 
@@ -244,7 +245,7 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
       setCreating(false)
     } catch (caught) {
       if (caught instanceof GreenApiError) setError(caught.message)
-      else setError('Запрос к GREEN-API не выполнился.')
+      else setError(errorText.generic)
     } finally {
       setPending(false)
     }
@@ -260,7 +261,7 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
     const text = draft
     if (text.trim().length === 0) return
     if ([...text].length > messageLimit) {
-      setComposerError('Текст сообщения длиннее 4096 символов.')
+      setComposerError(errorText.tooLong)
       return
     }
 
@@ -347,7 +348,7 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
 
   return (
     <div className={activeChat ? 'workspace is-thread' : 'workspace'}>
-      {offline ? <p className="offline-banner">Нет связи</p> : null}
+      {receiveNotice ? <p className="offline-banner">{receiveNotice}</p> : null}
       {!canSend ? <p className="instance-banner">{instanceMessage(inbox.instanceState)}</p> : null}
       <div className="workspace-body">
         <aside className="chat-list">
@@ -740,10 +741,8 @@ function outgoingStatus(message: ChatMessage): string {
 }
 
 function instanceMessage(state: string): string {
-  if (state === 'notAuthorized' || state === 'starting') {
-    return 'Авторизуйте инстанс в личном кабинете GREEN-API.'
-  }
-  return `Инстанс сейчас недоступен (${state}).`
+  if (state === 'notAuthorized' || state === 'starting') return errorText.unauthorized
+  return errorText.instanceUnavailable
 }
 
 function initials(title: string): string {
