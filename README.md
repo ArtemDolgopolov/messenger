@@ -8,5 +8,12 @@
 
 ```bash
 npm install
+cp .env.example .env
 npm run dev
 ```
+
+В `.env` в переменную `VITE_GREEN_API_URL` вставьте `apiUrl` своего инстанса из [личного кабинета GREEN-API](https://console.green-api.com/). После правки файла перезапустите `npm run dev`.
+
+`idInstance` и `apiTokenInstance` тоже берутся в кабинете и вводятся на экране входа.
+
+Чтобы входящие сообщения приходили в браузер, поле `webhookUrl` в настройках инстанса должно быть пустым. Если оно заполнено, откройте настройки и очистите его: иначе приём по HTTP API недоступен.
