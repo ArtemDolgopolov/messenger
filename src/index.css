@@ -1,0 +1,14 @@
+html,
+body,
+#root,
+.app-shell {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  background: #fff;
+}
