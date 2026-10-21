@@ -4,6 +4,7 @@ export type ChatItem = {
   chatId: string
   phone: string
   title: string
+  username?: string
 }
 
 export type ChatMessage = {
@@ -13,6 +14,7 @@ export type ChatMessage = {
   text: string
   direction: 'in' | 'out'
   status: 'sending' | 'sent' | 'failed' | 'received'
+  sentAt: number
 }
 
 export type InboxState = {
@@ -89,6 +91,7 @@ function mergeOutgoing(state: InboxState, note: Notification, chatId: string): I
         text: content.text,
         direction: 'out',
         status: 'sent',
+        sentAt: sentAtFrom(note.body),
       },
     ],
   }
@@ -117,16 +120,41 @@ function addIncoming(state: InboxState, note: Notification, chatId: string): Inb
         text: content.text,
         direction: 'in',
         status: 'received',
+        sentAt: sentAtFrom(note.body),
       },
     ],
   }
 }
 
 function ensureChat(chats: ChatItem[], body: NotificationBody, chatId: string): ChatItem[] {
-  if (chats.some((chat) => chat.chatId === chatId)) return chats
   const phone = body.senderData?.senderPhoneNumber ? String(body.senderData.senderPhoneNumber) : ''
-  const title = body.senderData?.chatName?.trim() || phone || chatId
-  return [{ chatId, phone, title }, ...chats]
+  const realName = profileName(body)
+  const existing = chats.find((chat) => chat.chatId === chatId)
+  if (existing) {
+    if (!realName || !isPlaceholderTitle(existing.title)) return chats
+    return chats.map((chat) => (chat.chatId === chatId ? { ...chat, title: realName, phone: chat.phone || phone } : chat))
+  }
+  return [{ chatId, phone, title: realName || phone || chatId }, ...chats]
+}
+
+function profileName(body: NotificationBody): string {
+  const data = body.senderData
+  const candidates = [data?.senderContactName, data?.chatName, data?.senderName]
+  for (const candidate of candidates) {
+    const value = candidate?.trim() ?? ''
+    if (value && !value.startsWith('@')) return value
+  }
+  return ''
+}
+
+export function isPlaceholderTitle(title: string): boolean {
+  return title.startsWith('@') || /^\d+$/.test(title)
+}
+
+function sentAtFrom(body: NotificationBody): number {
+  const timestamp = body.timestamp
+  if (!timestamp) return Date.now()
+  return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp
 }
 
 function messageContent(body: NotificationBody): { text: string; other: boolean } {

@@ -1,5 +1,6 @@
 import type {
   CheckAccountResult,
+  ContactInfo,
   DeleteNotificationResult,
   GreenApiConfig,
   Notification,
@@ -11,6 +12,7 @@ import type {
 const messageLimit = 4096
 
 const accountCache = new Map<string, CheckAccountResult>()
+const contactCache = new Map<string, ContactInfo>()
 
 export class GreenApiError extends Error {
   readonly status: number
@@ -27,6 +29,7 @@ export class GreenApiError extends Error {
 export type GreenApiClient = {
   getStateInstance: () => Promise<StateInstanceResult>
   checkAccount: (phone: string) => Promise<CheckAccountResult>
+  getContactInfo: (chatId: string) => Promise<ContactInfo>
   sendMessage: (chatId: string, message: string) => Promise<SendMessageResult>
   receiveNotification: (receiveTimeout?: number) => Promise<Notification | null>
   deleteNotification: (receiptId: number) => Promise<DeleteNotificationResult>
@@ -71,6 +74,24 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
       })
       const result = parseCheckAccount(body)
       accountCache.set(key, result)
+      return result
+    },
+
+    async getContactInfo(chatId) {
+      const id = chatId.trim()
+      if (!id) throw new GreenApiError('Не указан chatId.', 400, 'empty_chat')
+
+      const key = `${idInstance}:${id}`
+      const saved = contactCache.get(key)
+      if (saved) return saved
+
+      const body = await request(endpoint('getContactInfo'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId: id }),
+      })
+      const result = parseContactInfo(body)
+      contactCache.set(key, result)
       return result
     },
 
@@ -208,6 +229,17 @@ function parseCheckAccount(body: unknown): CheckAccountResult {
     username: typeof body.username === 'string' ? body.username : undefined,
     phoneNumber: typeof body.phoneNumber === 'number' ? body.phoneNumber : undefined,
     fromCache: typeof body.fromCache === 'boolean' ? body.fromCache : undefined,
+  }
+}
+
+function parseContactInfo(body: unknown): ContactInfo {
+  if (!isRecord(body)) {
+    throw new GreenApiError('GREEN-API вернул неожиданный ответ.', 200, 'invalid_contact')
+  }
+  return {
+    name: typeof body.name === 'string' ? body.name : '',
+    contactName: typeof body.contactName === 'string' ? body.contactName : '',
+    username: typeof body.username === 'string' ? body.username : '',
   }
 }
 

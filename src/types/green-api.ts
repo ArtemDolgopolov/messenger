@@ -16,6 +16,12 @@ export type CheckAccountResult = {
   fromCache?: boolean
 }
 
+export type ContactInfo = {
+  name: string
+  contactName: string
+  username: string
+}
+
 export type SendMessageResult = {
   idMessage: string
 }
