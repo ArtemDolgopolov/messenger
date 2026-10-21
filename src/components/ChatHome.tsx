@@ -1,14 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
-import { createGreenApi, GreenApiError, normalizePhone } from '../api/client.ts'
+import { createGreenApi, exportAccounts, GreenApiError, hydrateAccounts, normalizePhone } from '../api/client.ts'
+import type { HistoryEntry, ListedChat } from '../types/green-api.ts'
 import { applyNotification, isPlaceholderTitle } from '../state/notifications.ts'
 import type { ChatItem, ChatMessage, InboxState } from '../state/notifications.ts'
+import { readCabinet, writeCabinet } from '../storage/session.ts'
 import type { GreenApiConfig } from '../types/green-api.ts'
 
 const messageLimit = 4096
 const missingAccountMessage =
   'Telegram на этом номере не найден или скрыт настройками приватности.'
 const avatarColors = ['#3390ec', '#4fae4e', '#e36a5d', '#7b68ee', '#e39b2b', '#3d9a9a']
+const messageSkeleton = [
+  { side: 'in', lines: 2 },
+  { side: 'out', lines: 1 },
+  { side: 'in', lines: 1 },
+  { side: 'out', lines: 2 },
+  { side: 'in', lines: 3 },
+  { side: 'out', lines: 1 },
+]
+
+type ReplyTarget = {
+  chatId: string
+  idMessage: string
+  author: string
+  text: string
+}
 
 type ChatHomeProps = {
   session: GreenApiConfig
@@ -30,8 +47,14 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
   const [pending, setPending] = useState(false)
   const [draft, setDraft] = useState('')
   const [composerError, setComposerError] = useState('')
+  const [replyTo, setReplyTo] = useState<ReplyTarget | null>(null)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
   const [offline, setOffline] = useState(false)
+  const [hydrated, setHydrated] = useState(false)
+  const [chatsLoading, setChatsLoading] = useState(true)
+  const [historySettled, setHistorySettled] = useState<Record<string, true>>({})
   const logRef = useRef<HTMLDivElement>(null)
+  const draftRef = useRef<HTMLTextAreaElement>(null)
   const sessionEndRef = useRef(onSessionEnd)
 
   useEffect(() => {
@@ -47,6 +70,73 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
     const log = logRef.current
     if (log) log.scrollTop = log.scrollHeight
   }, [inbox.messages, activeChatId])
+
+  useEffect(() => {
+    let cancelled = false
+    void readCabinet(session.idInstance).then((cabinet) => {
+      if (cancelled) return
+      if (cabinet) {
+        hydrateAccounts(session.idInstance, cabinet.accounts)
+        setInbox({
+          chats: cabinet.chats,
+          messages: cabinet.messages,
+          instanceState: 'authorized',
+        })
+      }
+      setHydrated(true)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [session.idInstance])
+
+  useEffect(() => {
+    if (!hydrated) return
+    let cancelled = false
+    void api
+      .getChats()
+      .then((remote) => {
+        if (cancelled) return
+        setInbox((current) => ({ ...current, chats: mergeChatList(current.chats, remote) }))
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setChatsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [api, hydrated])
+
+  useEffect(() => {
+    if (!hydrated || !activeChatId || historySettled[activeChatId]) return
+    const chatId = activeChatId
+    let cancelled = false
+    void api
+      .getChatHistory(chatId)
+      .then((entries) => {
+        if (cancelled) return
+        setHistorySettled((current) => ({ ...current, [chatId]: true }))
+        setInbox((current) => mergeHistory(current, entries))
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [api, hydrated, activeChatId, historySettled])
+
+  useEffect(() => {
+    if (!hydrated) return
+    const timer = window.setTimeout(() => {
+      void writeCabinet(session.idInstance, {
+        session,
+        chats: inbox.chats,
+        messages: inbox.messages,
+        accounts: exportAccounts(session.idInstance),
+      })
+    }, 150)
+    return () => window.clearTimeout(timer)
+  }, [hydrated, session, inbox])
 
   const placeholderChatId = activeChat && isPlaceholderTitle(activeChat.title) ? activeChat.chatId : null
   const placeholderPhone = activeChat?.phone ?? ''
@@ -174,9 +264,11 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
       return
     }
 
+    const quotedMessageId = replyTo?.chatId === activeChat.chatId ? replyTo.idMessage : null
     setComposerError('')
     setDraft('')
-    void deliver(activeChat.chatId, text)
+    setReplyTo(null)
+    void deliver(activeChat.chatId, text, `local-${crypto.randomUUID()}`, quotedMessageId)
   }
 
   function handleDraftKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -186,14 +278,51 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
     }
   }
 
-  async function deliver(chatId: string, text: string, localId = `local-${crypto.randomUUID()}`) {
+  function startReply(message: ChatMessage) {
+    if (!message.idMessage || !activeChat) return
+    setReplyTo({
+      chatId: message.chatId,
+      idMessage: message.idMessage,
+      author: message.direction === 'out' ? 'Вы' : activeChat.title,
+      text: message.text,
+    })
+    setComposerError('')
+    draftRef.current?.focus()
+  }
+
+  async function removeMessage(message: ChatMessage) {
+    if (!message.idMessage || deletingId) return
+    setDeletingId(message.localId)
+    setComposerError('')
+    try {
+      await api.deleteMessage(message.chatId, message.idMessage)
+      setInbox((current) => ({
+        ...current,
+        messages: current.messages.filter(
+          (item) => item.localId !== message.localId && item.idMessage !== message.idMessage,
+        ),
+      }))
+      setReplyTo((current) => (current?.idMessage === message.idMessage ? null : current))
+    } catch (caught) {
+      setComposerError(caught instanceof GreenApiError ? caught.message : 'Не удалось удалить сообщение.')
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  async function deliver(
+    chatId: string,
+    text: string,
+    localId = `local-${crypto.randomUUID()}`,
+    quotedMessageId: string | null = null,
+  ) {
     setInbox((current) => ({
       ...current,
-      messages: upsertOutgoing(current.messages, { localId, chatId, text }),
+      messages: upsertOutgoing(current.messages, { localId, chatId, text, quotedMessageId }),
     }))
 
     try {
-      const result = await api.sendMessage(chatId, text)
+      const result = await api.sendMessage(chatId, text, quotedMessageId || undefined)
       setInbox((current) => ({
         ...current,
         messages: current.messages.some(
@@ -270,6 +399,22 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
               </div>
             </form>
           ) : null}
+          {chatsLoading ? (
+            <ul className="chat-skeleton" aria-busy="true" aria-label="Загружаем чаты">
+              {Array.from({ length: 8 }, (_, index) => (
+                <li key={index} className="chat-skeleton-row">
+                  <span className="skeleton skeleton-avatar" />
+                  <span className="chat-row-main">
+                    <span className="chat-row-top">
+                      <span className="skeleton skeleton-title" />
+                      <span className="skeleton skeleton-time" />
+                    </span>
+                    <span className="skeleton skeleton-preview" />
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
           <ul>
             {orderedChats.map((chat) => {
               const latest = latestMessage(inbox.messages, chat.chatId)
@@ -278,6 +423,7 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
                   <button
                     type="button"
                     className={chat.chatId === activeChatId ? 'chat-row is-active' : 'chat-row'}
+                    data-chat-id={chat.chatId}
                     onClick={() => setActiveChatId(chat.chatId)}
                   >
                     <span className="avatar" style={{ background: avatarColor(chat.chatId) }}>
@@ -288,13 +434,14 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
                         <span className="chat-title">{chat.title}</span>
                         {latest ? <time className="chat-time">{formatListTime(latest.sentAt)}</time> : null}
                       </span>
-                      <span className="chat-preview">{latest ? previewText(latest) : chat.phone}</span>
+                      <span className="chat-preview">{latest ? previewText(latest) : chat.phone || chat.username || ''}</span>
                     </span>
                   </button>
                 </li>
               )
             })}
           </ul>
+          )}
         </aside>
         <section className="conversation">
           {activeChat ? (
@@ -312,6 +459,18 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
                 </span>
               </header>
               <div className="conversation-log" ref={logRef}>
+                {visibleMessages.length === 0 && !historySettled[activeChat.chatId] ? (
+                  <div className="message-skeleton" aria-busy="true" aria-label="Загружаем сообщения">
+                    {messageSkeleton.map((bubble, index) => (
+                      <div key={index} className={`message-skeleton-bubble is-${bubble.side}`}>
+                        <span className="skeleton skeleton-author" />
+                        {Array.from({ length: bubble.lines }, (_, line) => (
+                          <span key={line} className="skeleton skeleton-line" />
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
                 {groupMessages(visibleMessages).map((item) =>
                   item.kind === 'day' ? (
                     <div key={item.key} className="day-separator">
@@ -320,15 +479,41 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
                   ) : (
                     <article key={item.message.localId} className={`message message-${item.message.direction}`}>
                       <p className="message-author">{item.message.direction === 'out' ? 'Вы' : activeChat.title}</p>
+                      {item.message.quotedMessageId ? (
+                        <blockquote className="message-quote">
+                          <QuoteBody messages={inbox.messages} quotedMessageId={item.message.quotedMessageId} chatId={item.message.chatId} title={activeChat.title} />
+                        </blockquote>
+                      ) : null}
                       <p>{item.message.text}</p>
                       <div className={item.message.status === 'failed' ? 'message-meta is-failed' : 'message-meta'}>
                         {item.message.direction === 'out' ? <span>{outgoingStatus(item.message)}</span> : null}
                         <time>{formatTime(item.message.sentAt)}</time>
+                        {item.message.idMessage ? (
+                          <button type="button" onClick={() => startReply(item.message)}>
+                            Ответить
+                          </button>
+                        ) : null}
+                        {item.message.direction === 'out' && item.message.idMessage && item.message.status === 'sent' ? (
+                          <button
+                            type="button"
+                            disabled={deletingId === item.message.localId}
+                            onClick={() => {
+                              void removeMessage(item.message)
+                            }}
+                          >
+                            {deletingId === item.message.localId ? 'Удаляем…' : 'Удалить'}
+                          </button>
+                        ) : null}
                         {item.message.status === 'failed' ? (
                           <button
                             type="button"
                             onClick={() => {
-                              void deliver(item.message.chatId, item.message.text, item.message.localId)
+                              void deliver(
+                                item.message.chatId,
+                                item.message.text,
+                                item.message.localId,
+                                item.message.quotedMessageId ?? null,
+                              )
                             }}
                           >
                             Повторить
@@ -346,6 +531,17 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
                   submitDraft()
                 }}
               >
+                {replyTo && replyTo.chatId === activeChat.chatId ? (
+                  <div className="reply-bar">
+                    <div className="reply-bar-text">
+                      <strong>{replyTo.author}</strong>
+                      <span>{replyTo.text}</span>
+                    </div>
+                    <button type="button" aria-label="Отменить ответ" onClick={() => setReplyTo(null)}>
+                      ×
+                    </button>
+                  </div>
+                ) : null}
                 {composerError ? (
                   <p className="form-error" role="alert">
                     {composerError}
@@ -353,6 +549,7 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
                 ) : null}
                 <div className="composer-row">
                   <textarea
+                    ref={draftRef}
                     name="message"
                     rows={1}
                     value={draft}
@@ -378,7 +575,10 @@ export function ChatHome({ session, onLogout, onSessionEnd }: ChatHomeProps) {
   )
 }
 
-function upsertOutgoing(messages: ChatMessage[], next: { localId: string; chatId: string; text: string }) {
+function upsertOutgoing(
+  messages: ChatMessage[],
+  next: { localId: string; chatId: string; text: string; quotedMessageId: string | null },
+) {
   const exists = messages.some((message) => message.localId === next.localId)
   if (!exists) {
     return [
@@ -391,11 +591,14 @@ function upsertOutgoing(messages: ChatMessage[], next: { localId: string; chatId
         direction: 'out' as const,
         status: 'sending' as const,
         sentAt: Date.now(),
+        quotedMessageId: next.quotedMessageId,
       },
     ]
   }
   return messages.map((message) =>
-    message.localId === next.localId ? { ...message, status: 'sending' as const } : message,
+    message.localId === next.localId
+      ? { ...message, status: 'sending' as const, quotedMessageId: next.quotedMessageId ?? message.quotedMessageId }
+      : message,
   )
 }
 
@@ -450,9 +653,84 @@ function chatSubtitle(chat: ChatItem): string {
   return chat.phone
 }
 
+function mergeChatList(current: ChatItem[], remote: ListedChat[]): ChatItem[] {
+  const known = new Map(current.map((chat) => [chat.chatId, chat]))
+  const next: ChatItem[] = []
+  for (const item of remote) {
+    const chat = listedChat(item)
+    const existing = known.get(chat.chatId)
+    if (!existing) {
+      next.push(chat)
+      continue
+    }
+    known.delete(chat.chatId)
+    next.push({
+      ...existing,
+      phone: existing.phone || chat.phone,
+      username: existing.username || chat.username,
+      title: isPlaceholderTitle(existing.title) ? chat.title : existing.title,
+    })
+  }
+  for (const chat of known.values()) next.push(chat)
+  return next
+}
+
+function listedChat(chat: ListedChat): ChatItem {
+  const username = chat.username ? (chat.username.startsWith('@') ? chat.username : `@${chat.username}`) : ''
+  return {
+    chatId: chat.chatId,
+    phone: chat.phone,
+    username,
+    title: chat.name || username || chat.phone || chat.chatId,
+  }
+}
+
+function mergeHistory(state: InboxState, entries: HistoryEntry[]): InboxState {
+  const known = new Set(state.messages.map((message) => message.idMessage).filter((id) => id))
+  const fresh = entries
+    .filter((entry) => !known.has(entry.idMessage))
+    .sort((left, right) => left.sentAt - right.sentAt)
+    .map((entry) => ({
+      localId: entry.idMessage,
+      idMessage: entry.idMessage,
+      chatId: entry.chatId,
+      text: entry.text,
+      direction: entry.direction,
+      status: entry.direction === 'out' ? ('sent' as const) : ('received' as const),
+      sentAt: entry.sentAt,
+      quotedMessageId: entry.quotedMessageId,
+    }))
+  if (fresh.length === 0) return state
+  return {
+    ...state,
+    messages: [...state.messages, ...fresh].sort((left, right) => left.sentAt - right.sentAt),
+  }
+}
+
 function previewText(message: ChatMessage): string {
   if (message.direction === 'out') return `Вы: ${message.text}`
   return message.text
+}
+
+function QuoteBody({
+  messages,
+  quotedMessageId,
+  chatId,
+  title,
+}: {
+  messages: ChatMessage[]
+  quotedMessageId: string
+  chatId: string
+  title: string
+}) {
+  const quoted = messages.find((message) => message.chatId === chatId && message.idMessage === quotedMessageId)
+  if (!quoted) return <span>Сообщение</span>
+  return (
+    <>
+      <strong>{quoted.direction === 'out' ? 'Вы' : title}</strong>
+      <span>{quoted.text}</span>
+    </>
+  )
 }
 
 function outgoingStatus(message: ChatMessage): string {

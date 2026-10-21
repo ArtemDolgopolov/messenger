@@ -2,6 +2,8 @@ import type {
   CheckAccountResult,
   ContactInfo,
   DeleteNotificationResult,
+  HistoryEntry,
+  ListedChat,
   GreenApiConfig,
   Notification,
   NotificationBody,
@@ -30,13 +32,32 @@ export type GreenApiClient = {
   getStateInstance: () => Promise<StateInstanceResult>
   checkAccount: (phone: string) => Promise<CheckAccountResult>
   getContactInfo: (chatId: string) => Promise<ContactInfo>
-  sendMessage: (chatId: string, message: string) => Promise<SendMessageResult>
+  getChats: () => Promise<ListedChat[]>
+  getChatHistory: (chatId: string, count?: number) => Promise<HistoryEntry[]>
+  sendMessage: (chatId: string, message: string, quotedMessageId?: string) => Promise<SendMessageResult>
+  deleteMessage: (chatId: string, idMessage: string) => Promise<void>
   receiveNotification: (receiveTimeout?: number) => Promise<Notification | null>
   deleteNotification: (receiptId: number) => Promise<DeleteNotificationResult>
 }
 
 export function normalizePhone(phone: string): string {
   return phone.replace(/\D/g, '')
+}
+
+export function hydrateAccounts(idInstance: string, accounts: Record<string, CheckAccountResult>) {
+  for (const [phone, result] of Object.entries(accounts)) {
+    if (!result || typeof result.chatId !== 'string') continue
+    accountCache.set(`${idInstance}:${phone}`, result)
+  }
+}
+
+export function exportAccounts(idInstance: string): Record<string, CheckAccountResult> {
+  const prefix = `${idInstance}:`
+  const accounts: Record<string, CheckAccountResult> = {}
+  for (const [key, result] of accountCache) {
+    if (key.startsWith(prefix)) accounts[key.slice(prefix.length)] = result
+  }
+  return accounts
 }
 
 export function createGreenApi(config: GreenApiConfig): GreenApiClient {
@@ -95,7 +116,23 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
       return result
     },
 
-    async sendMessage(chatId, message) {
+    async getChats() {
+      const body = await request(endpoint('getChats'))
+      return parseChats(body)
+    },
+
+    async getChatHistory(chatId, count = 50) {
+      const id = chatId.trim()
+      if (!id) return []
+      const body = await request(endpoint('getChatHistory'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId: id, count }),
+      })
+      return parseHistory(body, id)
+    },
+
+    async sendMessage(chatId, message, quotedMessageId) {
       const text = message
       if (text.trim().length === 0) {
         throw new GreenApiError('Пустое сообщение не отправляется.', 400, 'empty_message')
@@ -107,12 +144,26 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
         throw new GreenApiError('Не указан chatId.', 400, 'empty_chat')
       }
 
+      const payload: { chatId: string; message: string; quotedMessageId?: string } = { chatId, message: text }
+      if (quotedMessageId) payload.quotedMessageId = quotedMessageId
+
       const body = await request(endpoint('sendMessage'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId, message: text }),
+        body: JSON.stringify(payload),
       })
       return parseSendMessage(body)
+    },
+
+    async deleteMessage(chatId, idMessage) {
+      if (!chatId.trim() || !idMessage.trim()) {
+        throw new GreenApiError('Не указано сообщение для удаления.', 400, 'empty_delete')
+      }
+      await request(endpoint('deleteMessage'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId, idMessage, onlySenderDelete: false }),
+      })
     },
 
     async receiveNotification(receiveTimeout = 20) {
@@ -207,6 +258,12 @@ function toError(status: number, body: unknown): GreenApiError {
   if (reason?.toLowerCase().includes('phonenumber')) {
     return new GreenApiError('Номер должен содержать только цифры.', status, reason)
   }
+  if (reason === 'Message by id not found') {
+    return new GreenApiError('Сообщение уже удалено или не найдено.', status, reason)
+  }
+  if (reason === 'Deleting this message type is not supported') {
+    return new GreenApiError('Это сообщение нельзя удалить.', status, reason)
+  }
 
   return new GreenApiError('Запрос к GREEN-API не выполнился.', status, reason)
 }
@@ -230,6 +287,51 @@ function parseCheckAccount(body: unknown): CheckAccountResult {
     phoneNumber: typeof body.phoneNumber === 'number' ? body.phoneNumber : undefined,
     fromCache: typeof body.fromCache === 'boolean' ? body.fromCache : undefined,
   }
+}
+
+function parseChats(body: unknown): ListedChat[] {
+  if (!Array.isArray(body)) {
+    throw new GreenApiError('GREEN-API вернул неожиданный ответ.', 200, 'invalid_chats')
+  }
+  const chats: ListedChat[] = []
+  for (const item of body) {
+    if (!isRecord(item) || (typeof item.chatId !== 'string' && typeof item.chatId !== 'number')) continue
+    const chatId = String(item.chatId)
+    if (!chatId) continue
+    chats.push({
+      chatId,
+      name: typeof item.name === 'string' ? item.name.trim() : '',
+      phone: typeof item.phoneNumber === 'number' && item.phoneNumber > 0 ? String(item.phoneNumber) : '',
+      username: typeof item.username === 'string' ? item.username.trim() : '',
+    })
+  }
+  return chats
+}
+
+function parseHistory(body: unknown, chatId: string): HistoryEntry[] {
+  if (!Array.isArray(body)) return []
+  const entries: HistoryEntry[] = []
+  for (const item of body) {
+    if (!isRecord(item)) continue
+    const idMessage = typeof item.idMessage === 'string' ? item.idMessage : ''
+    if (!idMessage) continue
+    const timestamp = typeof item.timestamp === 'number' ? item.timestamp : 0
+    if (item.isDeleted === true || item.typeMessage === 'deletedMessage') continue
+    const text =
+      item.typeMessage === 'textMessage' && typeof item.textMessage === 'string'
+        ? item.textMessage
+        : 'сообщение другого типа'
+    const quoted = isRecord(item.quotedMessage) ? item.quotedMessage.stanzaId : ''
+    entries.push({
+      idMessage,
+      chatId,
+      text,
+      direction: item.type === 'outgoing' ? 'out' : 'in',
+      sentAt: timestamp > 0 && timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp || Date.now(),
+      quotedMessageId: typeof quoted === 'string' && quoted ? quoted : null,
+    })
+  }
+  return entries
 }
 
 function parseContactInfo(body: unknown): ContactInfo {

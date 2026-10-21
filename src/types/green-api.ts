@@ -22,6 +22,22 @@ export type ContactInfo = {
   username: string
 }
 
+export type ListedChat = {
+  chatId: string
+  name: string
+  phone: string
+  username: string
+}
+
+export type HistoryEntry = {
+  idMessage: string
+  chatId: string
+  text: string
+  direction: 'in' | 'out'
+  sentAt: number
+  quotedMessageId: string | null
+}
+
 export type SendMessageResult = {
   idMessage: string
 }
@@ -40,6 +56,13 @@ export type MessageData = {
   typeMessage: string
   textMessageData?: {
     textMessage: string
+  }
+  quotedMessage?: {
+    stanzaId?: string
+    participant?: string
+  }
+  deletedMessageData?: {
+    stanzaId?: string
   }
 }
 

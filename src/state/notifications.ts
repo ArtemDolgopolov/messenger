@@ -15,6 +15,7 @@ export type ChatMessage = {
   direction: 'in' | 'out'
   status: 'sending' | 'sent' | 'failed' | 'received'
   sentAt: number
+  quotedMessageId?: string | null
 }
 
 export type InboxState = {
@@ -34,6 +35,15 @@ export function applyNotification(state: InboxState, note: Notification): InboxS
 
   const chatId = body.senderData?.chatId
   if (!chatId) return state
+
+  if (body.messageData?.typeMessage === 'deletedMessage') {
+    const stanzaId = body.messageData.deletedMessageData?.stanzaId
+    if (!stanzaId) return state
+    return {
+      ...state,
+      messages: state.messages.filter((message) => !(message.chatId === chatId && message.idMessage === stanzaId)),
+    }
+  }
 
   if (body.typeWebhook === 'outgoingAPIMessageReceived') {
     return mergeOutgoing(state, note, chatId)
@@ -70,7 +80,12 @@ function mergeOutgoing(state: InboxState, note: Notification, chatId: string): I
       chats,
       messages: state.messages.map((message) =>
         message.localId === pending.localId
-          ? { ...message, idMessage: idMessage ?? message.idMessage, status: 'sent' }
+          ? {
+              ...message,
+              idMessage: idMessage ?? message.idMessage,
+              status: 'sent',
+              quotedMessageId: quotedMessageId(note.body) ?? message.quotedMessageId ?? null,
+            }
           : message,
       ),
     }
@@ -92,6 +107,7 @@ function mergeOutgoing(state: InboxState, note: Notification, chatId: string): I
         direction: 'out',
         status: 'sent',
         sentAt: sentAtFrom(note.body),
+        quotedMessageId: quotedMessageId(note.body),
       },
     ],
   }
@@ -121,6 +137,7 @@ function addIncoming(state: InboxState, note: Notification, chatId: string): Inb
         direction: 'in',
         status: 'received',
         sentAt: sentAtFrom(note.body),
+        quotedMessageId: quotedMessageId(note.body),
       },
     ],
   }
@@ -155,6 +172,11 @@ function sentAtFrom(body: NotificationBody): number {
   const timestamp = body.timestamp
   if (!timestamp) return Date.now()
   return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp
+}
+
+function quotedMessageId(body: NotificationBody): string | null {
+  const stanzaId = body.messageData?.quotedMessage?.stanzaId
+  return stanzaId || null
 }
 
 function messageContent(body: NotificationBody): { text: string; other: boolean } {

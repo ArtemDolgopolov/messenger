@@ -8,33 +8,26 @@ import type { GreenApiConfig } from './types/green-api.ts'
 const unauthorizedMessage = 'Авторизуйте инстанс в личном кабинете GREEN-API.'
 
 export default function App() {
-  const [stored] = useState(readSession)
   const [session, setSession] = useState<GreenApiConfig | null>(null)
-  const [draft, setDraft] = useState<GreenApiConfig | null>(stored)
+  const [draft, setDraft] = useState<GreenApiConfig | null>(null)
   const [error, setError] = useState('')
   const [pending, setPending] = useState(false)
-  const [ready, setReady] = useState(stored === null)
+  const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    if (!stored) return
-
     let cancelled = false
-    void openSession(stored).then((result) => {
+    void restore().then((result) => {
       if (cancelled) return
-      if (result === 'authorized') {
-        setSession(stored)
-        setError('')
-      } else {
-        clearSession()
-        setError(result)
-      }
+      setDraft(result.draft)
+      setError(result.error)
+      setSession(result.session)
       setReady(true)
     })
 
     return () => {
       cancelled = true
     }
-  }, [stored])
+  }, [])
 
   async function handleSubmit(config: GreenApiConfig) {
     setPending(true)
@@ -42,7 +35,7 @@ export default function App() {
     setDraft(config)
     const result = await openSession(config)
     if (result === 'authorized') {
-      writeSession(config)
+      await writeSession(config)
       setSession(config)
       setError('')
     } else {
@@ -52,7 +45,7 @@ export default function App() {
   }
 
   function handleLogout() {
-    clearSession()
+    if (session) void clearSession(session.idInstance)
     setSession(null)
     setDraft(null)
     setError('')
@@ -82,12 +75,21 @@ export default function App() {
       onLogout={handleLogout}
       onSessionEnd={(message) => {
         setDraft(session)
-        clearSession()
+        void clearSession(session.idInstance)
         setSession(null)
         setError(message)
       }}
     />
   )
+}
+
+async function restore(): Promise<{ session: GreenApiConfig | null; draft: GreenApiConfig | null; error: string }> {
+  const stored = await readSession()
+  if (!stored) return { session: null, draft: null, error: '' }
+  const result = await openSession(stored)
+  if (result === 'authorized') return { session: stored, draft: stored, error: '' }
+  await clearSession(stored.idInstance)
+  return { session: null, draft: stored, error: result }
 }
 
 async function openSession(config: GreenApiConfig): Promise<'authorized' | string> {
