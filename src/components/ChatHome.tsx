@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import type { FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { FormEvent, KeyboardEvent } from 'react'
 import { createGreenApi, GreenApiError, normalizePhone } from '../api/client.ts'
 import type { GreenApiConfig } from '../types/green-api.ts'
 
@@ -8,6 +8,16 @@ type Chat = {
   phone: string
   title: string
 }
+
+type OutgoingMessage = {
+  localId: string
+  idMessage: string | null
+  chatId: string
+  text: string
+  status: 'sending' | 'sent' | 'failed'
+}
+
+const messageLimit = 4096
 
 type ChatHomeProps = {
   session: GreenApiConfig
@@ -25,8 +35,18 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
   const [phone, setPhone] = useState('')
   const [error, setError] = useState('')
   const [pending, setPending] = useState(false)
+  const [messages, setMessages] = useState<OutgoingMessage[]>([])
+  const [draft, setDraft] = useState('')
+  const [composerError, setComposerError] = useState('')
+  const logRef = useRef<HTMLDivElement>(null)
 
   const activeChat = chats.find((chat) => chat.chatId === activeChatId) ?? null
+  const visibleMessages = messages.filter((message) => message.chatId === activeChatId)
+
+  useEffect(() => {
+    const log = logRef.current
+    if (log) log.scrollTop = log.scrollHeight
+  }, [messages, activeChatId])
 
   async function createChat(rawPhone: string) {
     const digits = normalizePhone(rawPhone)
@@ -66,6 +86,56 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     void createChat(phone)
+  }
+
+  function submitDraft() {
+    if (!activeChat) return
+    const text = draft
+    if (text.trim().length === 0) return
+    if ([...text].length > messageLimit) {
+      setComposerError('Текст сообщения длиннее 4096 символов.')
+      return
+    }
+
+    setComposerError('')
+    setDraft('')
+    void deliver(activeChat.chatId, text)
+  }
+
+  function handleDraftKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault()
+      submitDraft()
+    }
+  }
+
+  async function deliver(chatId: string, text: string, localId = `local-${crypto.randomUUID()}`) {
+    setMessages((current) => {
+      const exists = current.some((message) => message.localId === localId)
+      if (!exists) {
+        return [...current, { localId, idMessage: null, chatId, text, status: 'sending' }]
+      }
+      return current.map((message) =>
+        message.localId === localId ? { ...message, status: 'sending' } : message,
+      )
+    })
+
+    try {
+      const result = await api.sendMessage(chatId, text)
+      setMessages((current) =>
+        current.map((message) =>
+          message.localId === localId
+            ? { ...message, idMessage: result.idMessage, status: 'sent' }
+            : message,
+        ),
+      )
+    } catch {
+      setMessages((current) =>
+        current.map((message) =>
+          message.localId === localId ? { ...message, status: 'failed' } : message,
+        ),
+      )
+    }
   }
 
   return (
@@ -135,10 +205,62 @@ export function ChatHome({ session, onLogout }: ChatHomeProps) {
         </aside>
         <section className="conversation">
           {activeChat ? (
-            <header className="conversation-bar">
-              <strong>{activeChat.title}</strong>
-              <span>{activeChat.phone}</span>
-            </header>
+            <>
+              <header className="conversation-bar">
+                <strong>{activeChat.title}</strong>
+                <span>{activeChat.phone}</span>
+              </header>
+              <div className="conversation-log" ref={logRef}>
+                {visibleMessages.map((message) => (
+                  <article key={message.localId} className="message">
+                    <p>{message.text}</p>
+                    <div className={message.status === 'failed' ? 'message-status is-failed' : 'message-status'}>
+                      <span>
+                        {message.status === 'sending'
+                          ? 'отправляется'
+                          : message.status === 'sent'
+                            ? 'отправлено'
+                            : 'не отправилось'}
+                      </span>
+                      {message.status === 'failed' ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void deliver(message.chatId, message.text, message.localId)
+                          }}
+                        >
+                          Повторить
+                        </button>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+              </div>
+              <form
+                className="composer"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  submitDraft()
+                }}
+              >
+                {composerError ? (
+                  <p className="form-error" role="alert">
+                    {composerError}
+                  </p>
+                ) : null}
+                <div className="composer-row">
+                  <textarea
+                    name="message"
+                    rows={1}
+                    value={draft}
+                    placeholder="Сообщение"
+                    onChange={(event) => setDraft(event.target.value)}
+                    onKeyDown={handleDraftKeyDown}
+                  />
+                  <button type="submit">Отправить</button>
+                </div>
+              </form>
+            </>
           ) : (
             <p className="conversation-empty">Создайте чат по номеру телефона.</p>
           )}
