@@ -45,7 +45,7 @@ export function applyNotification(state: InboxState, note: Notification): InboxS
     }
   }
 
-  if (body.typeWebhook === 'outgoingAPIMessageReceived') {
+  if (body.typeWebhook === 'outgoingMessageReceived' || body.typeWebhook === 'outgoingAPIMessageReceived') {
     return mergeOutgoing(state, note, chatId)
   }
 

@@ -54,6 +54,7 @@ export type GreenApiClient = {
   deleteMessage: (chatId: string, idMessage: string) => Promise<void>
   receiveNotification: (receiveTimeout?: number) => Promise<Notification | null>
   deleteNotification: (receiptId: number) => Promise<DeleteNotificationResult>
+  stopReceive: () => void
 }
 
 export function normalizePhone(phone: string): string {
@@ -98,10 +99,11 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
 
   const endpoint = (method: string, extra = '') =>
     `${apiUrl}/waInstance${idInstance}/${method}/${apiTokenInstance}${extra}`
+  const lane = createLane()
 
   return {
     async getStateInstance() {
-      const body = await request(endpoint('getStateInstance'))
+      const body = await lane.call(() => request(endpoint('getStateInstance')))
       return parseState(body)
     },
 
@@ -117,11 +119,13 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
 
       let body: unknown
       try {
-        body = await request(endpoint('checkAccount'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ phoneNumber: Number(digits) }),
-        })
+        body = await lane.call(() =>
+          request(endpoint('checkAccount'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phoneNumber: Number(digits) }),
+          }),
+        )
       } catch (error) {
         if (error instanceof GreenApiError && isRateLimit(error)) {
           throw new GreenApiError(errorText.phoneRateLimit, error.status || 469, error.reason)
@@ -141,29 +145,33 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
       const saved = contactCache.get(key)
       if (saved) return saved
 
-      const body = await request(endpoint('getContactInfo'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId: id }),
-      })
+      const body = await lane.call(() =>
+        request(endpoint('getContactInfo'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatId: id }),
+        }),
+      )
       const result = parseContactInfo(body)
       contactCache.set(key, result)
       return result
     },
 
     async getChats() {
-      const body = await request(endpoint('getChats'))
+      const body = await lane.call(() => request(endpoint('getChats')))
       return parseChats(body)
     },
 
     async getChatHistory(chatId, count = 50) {
       const id = chatId.trim()
       if (!id) return []
-      const body = await request(endpoint('getChatHistory'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId: id, count }),
-      })
+      const body = await lane.call(() =>
+        request(endpoint('getChatHistory'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatId: id, count }),
+        }),
+      )
       return parseHistory(body, id)
     },
 
@@ -182,11 +190,13 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
       const payload: { chatId: string; message: string; quotedMessageId?: string } = { chatId, message: text }
       if (quotedMessageId) payload.quotedMessageId = quotedMessageId
 
-      const body = await request(endpoint('sendMessage'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
+      const body = await lane.call(() =>
+        request(endpoint('sendMessage'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }),
+      )
       return parseSendMessage(body)
     },
 
@@ -194,25 +204,102 @@ export function createGreenApi(config: GreenApiConfig): GreenApiClient {
       if (!chatId.trim() || !idMessage.trim()) {
         throw new GreenApiError('Не указано сообщение для удаления.', 400, 'empty_delete')
       }
-      await request(endpoint('deleteMessage'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId, idMessage, onlySenderDelete: false }),
-      })
+      await lane.call(() =>
+        request(endpoint('deleteMessage'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatId, idMessage, onlySenderDelete: false }),
+        }),
+      )
     },
 
     async receiveNotification(receiveTimeout = 20) {
-      const body = await request(endpoint('receiveNotification', `?receiveTimeout=${receiveTimeout}`))
+      const body = await lane.receive((signal) =>
+        request(endpoint('receiveNotification', `?receiveTimeout=${receiveTimeout}`), { signal }),
+      )
       if (body === null) return null
       return parseNotification(body)
     },
 
     async deleteNotification(receiptId) {
-      const body = await request(endpoint('deleteNotification', `/${receiptId}`), {
-        method: 'DELETE',
-      })
+      const body = await lane.call(() =>
+        request(endpoint('deleteNotification', `/${receiptId}`), {
+          method: 'DELETE',
+        }),
+      )
       return parseDelete(body)
     },
+
+    stopReceive() {
+      lane.stopReceive()
+    },
+  }
+}
+
+function createLane() {
+  type Task = {
+    kind: 'call' | 'receive'
+    run: () => Promise<unknown>
+    resolve: (value: unknown) => void
+    reject: (error: unknown) => void
+  }
+
+  const tasks: Task[] = []
+  let pumping = false
+  let receiveAbort: AbortController | null = null
+
+  function stopReceive() {
+    receiveAbort?.abort()
+  }
+
+  function enqueue<T>(kind: 'call' | 'receive', run: () => Promise<T>, before?: () => void): Promise<T> {
+    before?.()
+    return new Promise<T>((resolve, reject) => {
+      const task: Task = {
+        kind,
+        run,
+        resolve: (value) => resolve(value as T),
+        reject,
+      }
+      const queuedReceive = kind === 'call' ? tasks.findIndex((item) => item.kind === 'receive') : -1
+      if (queuedReceive === -1) tasks.push(task)
+      else tasks.splice(queuedReceive, 0, task)
+      void pump()
+    })
+  }
+
+  async function pump() {
+    if (pumping) return
+    pumping = true
+    while (tasks.length > 0) {
+      const task = tasks.shift()
+      if (!task) break
+      try {
+        task.resolve(await task.run())
+      } catch (error) {
+        task.reject(error)
+      }
+    }
+    pumping = false
+    if (tasks.length > 0) void pump()
+  }
+
+  return {
+    call<T>(run: () => Promise<T>) {
+      return enqueue('call', run)
+    },
+    receive<T>(run: (signal: AbortSignal) => Promise<T>) {
+      return enqueue('receive', async () => {
+        const controller = new AbortController()
+        receiveAbort = controller
+        try {
+          return await run(controller.signal)
+        } finally {
+          if (receiveAbort === controller) receiveAbort = null
+        }
+      })
+    },
+    stopReceive,
   }
 }
 
@@ -220,7 +307,8 @@ async function request(url: string, init?: RequestInit): Promise<unknown> {
   let response: Response
   try {
     response = await fetch(url, init)
-  } catch {
+  } catch (error) {
+    if (isAbortError(error)) throw error
     throw new GreenApiError(errorText.network, 0, 'network')
   }
 
@@ -402,6 +490,10 @@ function parseDelete(body: unknown): DeleteNotificationResult {
     throw new GreenApiError('GREEN-API вернул неожиданный ответ.', 200, 'invalid_delete')
   }
   return { result: body.result }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
