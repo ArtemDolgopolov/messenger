@@ -76,7 +76,7 @@ export default function App() {
     )
   }
 
-  return <ChatHome idInstance={session.idInstance} onLogout={handleLogout} />
+  return <ChatHome session={session} onLogout={handleLogout} />
 }
 
 async function openSession(config: GreenApiConfig): Promise<'authorized' | string> {
